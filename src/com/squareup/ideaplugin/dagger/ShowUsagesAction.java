@@ -75,6 +75,7 @@ import com.intellij.psi.search.SearchScope;
 import com.intellij.ui.ActiveComponent;
 import com.intellij.ui.InplaceButton;
 import com.intellij.ui.ScreenUtil;
+import com.intellij.ui.ScrollingUtil;
 import com.intellij.ui.SpeedSearchBase;
 import com.intellij.ui.SpeedSearchComparator;
 import com.intellij.ui.TableScrollingUtil;
@@ -324,16 +325,13 @@ public class ShowUsagesAction extends AnAction implements PopupAction {
         (UsageViewImpl) manager.createUsageView(UsageTarget.EMPTY_ARRAY, Usage.EMPTY_ARRAY,
             presentation, null);
 
-    Disposer.register(usageView, new Disposable() {
-      @Override
-      public void dispose() {
-        myUsageViewSettings.loadState(usageViewSettings);
-        usageViewSettings.loadState(savedGlobalSettings);
-      }
+    Disposer.register(usageView, () -> {
+      myUsageViewSettings.loadState(usageViewSettings);
+      usageViewSettings.loadState(savedGlobalSettings);
     });
 
-    final List<Usage> usages = new ArrayList<Usage>();
-    final Set<UsageNode> visibleNodes = new LinkedHashSet<UsageNode>();
+    final List<Usage> usages = new ArrayList<>();
+    final Set<UsageNode> visibleNodes = new LinkedHashSet<>();
     UsageInfoToUsageConverter.TargetElementsDescriptor descriptor =
         new UsageInfoToUsageConverter.TargetElementsDescriptor(handler.getPrimaryElements(),
             handler.getSecondaryElements());
@@ -346,9 +344,9 @@ public class ShowUsagesAction extends AnAction implements PopupAction {
       visibleNodes.add(MORE_USAGES_SEPARATOR_NODE);
     }
 
-    addUsageNodes(usageView.getRoot(), usageView, new ArrayList<UsageNode>());
+    addUsageNodes(usageView.getRoot(), usageView, new ArrayList<>());
 
-    TableScrollingUtil.installActions(table);
+    ScrollingUtil.installActions(table);
 
     final List<UsageNode> data = collectData(usages, visibleNodes, usageView, presentation);
     setTableModel(table, usageView, data);
@@ -364,82 +362,63 @@ public class ShowUsagesAction extends AnAction implements PopupAction {
 
     // show popup only if find usages takes more than 300ms, otherwise it would flicker needlessly
     Alarm alarm = new Alarm(usageView);
-    alarm.addRequest(new Runnable() {
-      @Override
-      public void run() {
-        showPopupIfNeedTo(popup, popupPosition);
-      }
-    }, 300);
+    alarm.addRequest(() -> showPopupIfNeedTo(popup, popupPosition), 300);
 
-    final PingEDT pingEDT = new PingEDT("Rebuild popup in EDT", new Condition<Object>() {
-      @Override
-      public boolean value(Object o) {
-        return popup.isDisposed();
-      }
-    }, 100, new Runnable() {
-      @Override
-      public void run() {
-        if (popup.isDisposed()) return;
+    final PingEDT pingEDT = new PingEDT(
+            "Rebuild popup in EDT",
+            o -> popup.isDisposed(),
+            100,
+            () -> {
+              if (popup.isDisposed()) return;
 
-        final List<UsageNode> nodes = new ArrayList<UsageNode>();
-        List<Usage> copy;
-        synchronized (usages) {
-          // open up popup as soon as several usages 've been found
-          if (!popup.isVisible() && (usages.size() <= 1 || !showPopupIfNeedTo(popup,
-              popupPosition))) {
-            return;
-          }
-          addUsageNodes(usageView.getRoot(), usageView, nodes);
-          copy = new ArrayList<Usage>(usages);
-        }
+              final List<UsageNode> nodes = new ArrayList<>();
+              List<Usage> copy;
+              synchronized (usages) {
+                // open up popup as soon as several usages 've been found
+                if (!popup.isVisible() && (usages.size() <= 1 || !showPopupIfNeedTo(popup,
+                        popupPosition))) {
+                  return;
+                }
+                addUsageNodes(usageView.getRoot(), usageView, nodes);
+                copy = new ArrayList<>(usages);
+              }
 
-        rebuildPopup(usageView, copy, nodes, table, popup, presentation, popupPosition,
-            !processIcon.isDisposed());
-      }
-    }
+              rebuildPopup(usageView, copy, nodes, table, popup,
+                      presentation, popupPosition,!processIcon.isDisposed());
+            }
     );
 
     final MessageBusConnection messageBusConnection = project.getMessageBus().connect(usageView);
-    messageBusConnection.subscribe(UsageFilteringRuleProvider.RULES_CHANGED, new Runnable() {
-      @Override
-      public void run() {
-        pingEDT.ping();
-      }
-    });
+    messageBusConnection.subscribe(UsageFilteringRuleProvider.RULES_CHANGED, pingEDT::ping);
 
-    Processor<Usage> collect = new Processor<Usage>() {
-      private UsageTarget myUsageTarget =
-          new PsiElement2UsageTargetAdapter(handler.getPsiElement());
-
-      @Override
-      public boolean process(@NotNull Usage usage) {
-        synchronized (usages) {
-          if (visibleNodes.size() >= maxUsages) return false;
-          if (UsageViewManager.isSelfUsage(usage, new UsageTarget[] { myUsageTarget })) {
-            return true;
-          }
-
-          Usage usageToAdd = decider.shouldShow(myUsageTarget, usage) ? usage : null;
-          if (usageToAdd == null) return true;
-
-          UsageNode node = usageView.doAppendUsage(usageToAdd);
-          usages.add(usageToAdd);
-
-          if (node != null) {
-            visibleNodes.add(node);
-            boolean continueSearch = true;
-            if (visibleNodes.size() == maxUsages) {
-              visibleNodes.add(MORE_USAGES_SEPARATOR_NODE);
-              usages.add(MORE_USAGES_SEPARATOR);
-              continueSearch = false;
-            }
-            pingEDT.ping();
-
-            return continueSearch;
-          }
-
+    UsageTarget myUsageTarget = new PsiElement2UsageTargetAdapter(handler.getPsiElement());
+    Processor<Usage> collect = usage -> {
+      synchronized (usages) {
+        if (visibleNodes.size() >= maxUsages) return false;
+        if (UsageViewManager.isSelfUsage(usage, new UsageTarget[] { myUsageTarget })) {
           return true;
         }
+
+        Usage usageToAdd = decider.shouldShow(myUsageTarget, usage) ? usage : null;
+        if (usageToAdd == null) return true;
+
+        UsageNode node = usageView.doAppendUsage(usageToAdd);
+        usages.add(usageToAdd);
+
+        if (node != null) {
+          visibleNodes.add(node);
+          boolean continueSearch = true;
+          if (visibleNodes.size() == maxUsages) {
+            visibleNodes.add(MORE_USAGES_SEPARATOR_NODE);
+            usages.add(MORE_USAGES_SEPARATOR);
+            continueSearch = false;
+          }
+          pingEDT.ping();
+
+          return continueSearch;
+        }
+
+        return true;
       }
     };
 
